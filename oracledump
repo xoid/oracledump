@@ -1,0 +1,611 @@
+#!/usr/bin/perl
+
+use strict;
+
+use DBI;
+use Getopt::Long 2.16;
+use POSIX;
+use Term::ReadKey 2.14;
+
+
+#***********************************************************************
+# Local subroutines
+#***********************************************************************
+
+sub escape_data($$);            # escapes data for an SQL statement
+
+#***********************************************************************
+# Package 'main' variables set by the mod_perl CGI environment
+#***********************************************************************
+
+$ENV{ORACLE_HOME} = '/usr/oracle/app/oracle/product/8.0.5'
+    if (! exists $ENV{ORACLE_HOME});
+
+my $ORA_HOSTNAME;
+my $ORA_VERSION;
+
+my ($MAJOR_VERSION, $MINOR_VERSION) = q$Revision: 1.9 $ =~ /(\d+)\.(\d+)/;
+my $VERSION = sprintf("%d.%02d", $MAJOR_VERSION - 1, $MINOR_VERSION);
+
+my $dbh;                # database handle
+my $sth;                # statement handle
+my $table;              # foreach loop iterator
+
+my $CM = '--';          # comment marker for output; default is '--'
+
+
+#***********************************************************************
+# Parse command-line switches
+#***********************************************************************
+
+my $opt_database;               # database
+my @opt_tables;                 # tables
+
+my $opt_debug;                  # --debug
+my $opt_help;                   # -?|--help
+my $opt_comment_marker;         # --comment-marker
+my $opt_complete_insert;        # -c|--complete-insert
+my $opt_compress;               # -C|--compress
+my $opt_extend_insert_insert;   # -e|--extended_insert-insert
+my $opt_add_drop_table;         # --add-drop-table
+my $opt_add_locks;              # --add-locks
+my $opt_add_transaction;        # --add-transaction
+my $opt_allow_keywords;         # --allow-keywords
+my $opt_flush_logs;             # -F|--flush-logs
+my $opt_force;                  # -f|--force
+my $opt_host;                   # -h|--host
+my $opt_lock_tables;            # -l|--lock-tables
+my $opt_no_create_info;         # -t|--no-create-info
+my $opt_no_data;                # -d|--no-data
+my %opt_set_variable;           # -O|--set-variable
+my $opt_opt;                    # --opt
+my $opt_password;               # -p|--password
+my $opt_port;                   # -P|--port
+my $opt_quick;                  # -q|--quick
+my $opt_socket;                 # -S|--socket
+my $opt_tab;                    # -T|--tab
+my $opt_user;                   # -u|--user
+my $opt_verbose;                # -v|--verbose
+my $opt_version;                # -V|--version
+my @opt_where;                  # -w|--where
+my $opt_fields_terminated_by;   # --fields-terminated-by
+my $opt_fields_enclosed_by;     # --fields-enclosed-by
+my $opt_fields_optionally_enclosed_by;  # --fields-optionally-enclosed-by
+my $opt_fields_escaped_by;      # --fields-escaped-by
+my $opt_lines_terminated_by;    # --lines-terminated-by
+
+my $help = <<MARK;      # help statement
+
+oracledump v$VERSION
+
+Dumping definition and data for an Oracle database or table
+Usage: oracledump [options] database [tables]
+
+* -- Only switches with an asterisk are currently supported.
+
+  --debug=...           Output debug log. Often this is 'd:t:o,filename`
+* -?, --help            Displays this help and exits.
+* --comment-marker=...  Set comment marker to string; default is '--'
+  -c, --complete-insert Use complete insert statements.
+  -C, --compress        Use compression in server/client protocol
+  -e, --extended_insert-insert Allows utilization of the new, much faster
+                        INSERT syntax
+* --add-drop-table      Add a 'drop table' before each create
+  --add-locks           Add a locks around insert statements
+* --add-transaction     Add SQL to turn autocommit off before INSERT
+                        statements and to add a commit statement after
+  --allow-keywords      Allow creation of column names that are keywords
+  -F  --flush-logs      Flush logs file in server before starting dump
+  -f, --force           Continue even if we get an sql-error.
+  -h, --host=...        Connect to host.
+  -l, --lock-tables     Lock all tables for read.
+* -t, --no-create-info  Don't write table creation info.
+* -d, --no-data         No row information.
+  -O, --set-variable var=option
+                        give a variable an value. --help lists variables
+  --opt                 Same as --quick --add-drop-table --add-locks
+                        --extended_insert-insert --use-locks
+* -p, --password[=...]  Password to use when connecting to server.
+                        If password is not given it's asked from the tty.
+  -P, --port=...        Port number to use for connection.
+  -q, --quick           Don't buffer query, dump directly to stdout.
+  -S, --socket=...      Socket file to use for connection.
+  -T, --tab=...         Creates tab separated textfile for each table to
+                        given path. (creates .sql and .txt files)
+
+                        NOTE: This only works if mysqldump is run on
+                              the same machine as the mysqld daemon
+* -u, --user=#          User for login if not current user.
+  -v, --verbose         Print info about the various stages.
+* -V, --version         Output version information and exit.
+* -w, --where=          dump only selected records; QUOTES mandatory!
+  EXAMPLES: "--where=user='jimf'" "-wuserid>1" "-wuserid<1"
+  Use -T (--tab=...) with --fields-...
+  --fields-terminated-by=...
+                        Fields in the textfile are terminated by ...
+  --fields-enclosed-by=...
+                        Fields in the importfile are enclosed by ...
+  --fields-optionally-enclosed-by=...
+                        Fields in the i.file are opt. enclosed by ...
+  --fields-escaped-by=...
+                        Fields in the i.file are escaped by ...
+  --lines-terminated-by=...
+                        Lines in the i.file are terminated by ...
+
+Possible variables for option --set-variable (-O) are:
+<none>
+MARK
+
+
+## We want exact matches to the switches
+
+Getopt::Long::config('no_auto_abbrev', 'no_ignore_case');
+
+
+my $rc = GetOptions(
+                "debug=s"               => \$opt_debug,
+                "help|?"                => \$opt_help,
+                "comment-marker=s"      => \$opt_comment_marker,
+                "c|complete-insert"     => \$opt_complete_insert,
+                "C|compress"            => \$opt_compress,
+                "e|extended_insert-insert"=> \$opt_extend_insert_insert,
+                "add-drop-table"        => \$opt_add_drop_table,
+                "add-locks"             => \$opt_add_locks,
+                "add-transaction"       => \$opt_add_transaction,
+                "allow-keywords"        => \$opt_allow_keywords,
+                "F|flush-logs"          => \$opt_flush_logs,
+                "f|force"               => \$opt_force,
+                "h|host=s"              => \$opt_host,
+                "l|lock-tables"         => \$opt_lock_tables,
+                "t|no-create-info"      => \$opt_no_create_info,
+                "d|no-data"             => \$opt_no_data,
+                "O|set-variable=s%"     => \%opt_set_variable,
+                "opt"                   => \$opt_opt,
+                "p|password:s"          => \$opt_password,
+                "P|port=i"              => \$opt_port,
+                "q|quick"               => \$opt_quick,
+                "S|socket=i"            => \$opt_socket,
+                "T|tab=s"               => \$opt_tab,
+                "u|user=s"              => \$opt_user,
+                "v|verbose"             => \$opt_verbose,
+                "V|version"             => \$opt_version,
+                "w|where=s@"            => \@opt_where,
+                "fields-terminated-by=s"        => \$opt_fields_terminated_by,
+                "fields-enclosed-by=s"  => \$opt_fields_enclosed_by,
+                "fields-optionally-enclosed-by=s"       => \$opt_fields_optionally_enclosed_by,
+                "fields-escaped-by=s"   => \$opt_fields_escaped_by,
+                "lines-terminated-by=s" => \$opt_lines_terminated_by,
+                   );
+
+$opt_database = shift @ARGV;    # grab database name
+
+@opt_tables = splice(@ARGV, 0); # grab optional list of tables
+
+
+#***********************************************************************
+# Process command-line switches
+#***********************************************************************
+
+if (! $rc || defined $opt_help)
+{
+    print STDERR $help;
+    exit (defined $opt_help ? 0 : 1);
+}
+
+if (defined $opt_version)
+{
+    print STDERR "oracledump v$VERSION\n";
+    exit 0;
+}
+
+
+## After processing non-related switches, we *must* have a database defined
+
+if (! defined $opt_database)
+{
+    print STDERR "ERROR: Must define database\n", $help;
+    exit 1;
+}
+
+
+## Define $opt_user if it wasn't set
+
+if (! defined $opt_user)
+{
+    ($opt_user) = getpwuid($<);
+}
+
+
+## Read password into $opt_password if it wasn't set
+
+if (! defined $opt_password || $opt_password eq "")
+{
+    print "Username: $opt_user\n";
+    ReadMode 'noecho';
+    print "Password: ";
+    chop($opt_password = <STDIN>);
+    print "\n";
+    ReadMode 'restore';
+}
+
+
+## Set comment character if --comment-marker is set
+
+if (defined $opt_comment_marker && length($opt_comment_marker) > 0)
+{
+    $CM = $opt_comment_marker;
+}
+
+
+#***********************************************************************
+# Connect to the database with $dbh
+#***********************************************************************
+
+$dbh = DBI->connect("dbi:Oracle:$opt_database",
+                    $opt_user,
+                    $opt_password)
+    || die "Cannot connect to database: $DBI::errstr";
+
+
+#***********************************************************************
+# Turn autocommit *off* and set transaction to *read only*
+#***********************************************************************
+
+$dbh->{AutoCommit} = 0;
+
+$dbh->do("set transaction read only")
+    || die "Cannot set transaction to read only: $DBI::errstr";
+
+
+#***********************************************************************
+# Get list of tables if @opt_tables isn't set
+#***********************************************************************
+
+if (scalar @opt_tables < 1)
+{
+    my @row;
+
+    $sth = $dbh->prepare("SELECT table_name FROM user_tables");
+
+    $sth->execute() || die $DBI::errstr;
+
+    while (@row =  $sth->fetchrow_array())
+    {
+        push(@opt_tables, @row);
+    }
+
+    $sth->finish();
+}
+
+
+#***********************************************************************
+# Print out the header
+#***********************************************************************
+
+## Determine if we have access to the V$INSTANCE table
+
+$sth = $dbh->prepare("SELECT TABLE_NAME
+                        FROM DICTIONARY
+                       WHERE TABLE_NAME = ?");
+
+$sth->execute("V\$INSTANCE") || die $DBI::errstr;
+
+($table) = $sth->fetchrow_array();
+
+$sth->finish();
+
+if ($table eq "V\$INSTANCE")
+{
+    ## Query Oracle for its instance hostname
+
+    $sth = $dbh->prepare("SELECT HOST_NAME
+                            FROM V\$INSTANCE");
+    $sth->execute() || die $DBI::errstr;
+    ($ORA_HOSTNAME) = $sth->fetchrow_array();
+    $sth->finish();
+}
+else
+{
+    $ORA_HOSTNAME = '<V$INSTANCE.HOST_NAME inaccessible>';
+}
+
+
+## Query Oracle for its version
+
+$sth = $dbh->prepare("SELECT banner
+                        FROM V\$VERSION
+                       WHERE UPPER(banner) LIKE 'ORA%'");
+
+$sth->execute() || die $DBI::errstr;
+
+($ORA_VERSION) = $sth->fetchrow_array();
+
+$sth->finish();
+
+
+## Print header
+
+print <<MARK;
+$CM Oracle dump $VERSION
+$CM
+$CM Host: $ORA_HOSTNAME     Database: $opt_database
+$CM ------------------------------------------------------------
+$CM Server version: $ORA_VERSION
+MARK
+
+
+#***********************************************************************
+# Iterative over all tables, printing out requested information
+#***********************************************************************
+
+foreach $table (@opt_tables)
+{
+    my @column_types;
+    my @row;
+
+    ## Print table structure
+
+    if (! defined $opt_no_create_info)
+    {
+
+        ## Print the per-table header
+
+        print <<MARK;
+
+$CM
+$CM Table structure for table '$table'
+$CM
+MARK
+        ## Print drop table if requested
+
+        if (defined $opt_add_drop_table)
+        {
+            print <<MARK;
+DROP TABLE $table;
+MARK
+        }
+
+        ## Print create table
+
+        print <<MARK;
+CREATE TABLE $table (
+MARK
+
+    }
+
+    ## We always need this information to output data below
+
+    $sth = $dbh->prepare("SELECT column_name,
+                                 data_type,
+                                 data_length,
+                                 data_precision,
+                                 data_scale,
+                                 data_default,
+                                 nullable
+                            FROM user_tab_columns
+                           WHERE table_name = ?");
+
+    $sth->execute(uc($table)) || die $DBI::errstr;
+
+    my $c = 0;
+    while (@row = $sth->fetchrow_array())
+    {
+        $c++;
+        printf(" %1s%-22s%-15s%-21s%-8s\n",
+                ($c != 1 ? ',' : ' '),
+                 lc($row[0]),
+                 ($row[1] eq 'NUMBER'
+                  ? $row[1].'('.$row[3].', '.$row[4].')'
+                  : ($row[1] eq 'VARCHAR2'
+                     ? $row[1].'('.$row[2].')'
+                     : $row[1])),
+                 (defined $row[5]
+                  ? 'DEFAULT ' . $row[5]
+                  : ''),
+                 ($row[6] eq 'Y'
+                  ? ''
+                  : 'NOT NULL')
+                )
+            if (! defined $opt_no_create_info);
+        push(@column_types, $row[1]);
+    }
+
+    $sth->finish();
+
+    if (! defined $opt_no_create_info)
+    {
+        print <<MARK;
+);
+MARK
+    }
+
+
+    ## Dump data for table
+
+    if(! defined $opt_no_data)
+    {
+        my @column_names;
+
+
+        ## Print the per-table header
+
+        print <<MARK;
+
+$CM
+$CM Dumping data for table '$table'
+@{[ (scalar @opt_where > 0)
+    ? "$CM WHERE:  " . join(' AND ', @opt_where) . "\n$CM\n"
+    : "$CM\n" ]}
+MARK
+
+
+        ## Begin transaction processing
+
+        if (defined $opt_add_transaction)
+        {
+            print <<MARK;
+SET AUTOCOMMIT OFF;
+
+MARK
+        }
+
+
+        ## Generate list of column names
+
+        $sth = $dbh->prepare("SELECT column_name
+                                FROM user_tab_columns
+                               WHERE table_name = ?");
+
+        $sth->execute(uc($table)) || die $DBI::errstr;
+
+        while (@row = $sth->fetchrow_array())
+        {
+            push(@column_names, @row);
+        }
+
+        $sth->finish();
+
+
+        ## Query for data then output SQL
+
+        $sth = $dbh->prepare("SELECT @{[ join(',', @column_names) ]}
+                                FROM $table
+                              @{[ (scalar @opt_where > 0)
+                                  ? ' WHERE ' . join(' AND ', @opt_where)
+                                  : '' ]}");
+
+        $sth->execute() || die $DBI::errstr;
+
+        while (@row = $sth->fetchrow_array())
+        {
+            print <<MARK;
+INSERT INTO $table (@{[ join(', ', @column_names) ]})
+     VALUES (@{[ join(',', map(escape_data($column_types[$_], $row[$_]), 0..$#column_names)) ]});
+MARK
+        }
+
+        $sth->finish();
+
+
+        ## End transaction processing
+
+        if (defined $opt_add_transaction)
+        {
+            print <<MARK;
+
+COMMIT;
+
+MARK
+        }
+    }
+}
+
+
+#***********************************************************************
+# Buh-bye!
+#***********************************************************************
+
+$dbh->disconnect();
+
+exit 0;
+
+
+#***********************************************************************
+# Define local subroutines
+#***********************************************************************
+
+sub escape_data($$)
+{
+    my $type  = shift;
+    my $value = shift;
+
+    if ($type eq 'NUMBER')
+    {
+        return $value;
+    }
+    elsif ($type eq 'VARCHAR2')
+    {
+        if (! defined $value)
+        {
+            return "NULL";
+        }
+        else
+        {
+            $value =~ s/'/\\'/g;
+            return "'$value'";
+        }
+    }
+    elsif ($type eq 'DATE')
+    {
+        if (! defined $value)
+        {
+            return "NULL";
+        }
+        else
+        {
+            return "'$value'";
+        }
+    }
+    else
+    {
+        die "Unknown type: $type\n";
+    }
+}
+
+
+__END__
+
+
+=pod
+
+=head1 NAME
+
+oracledump - dumps table data from Oracle in SQL script format
+
+=head1 SYNOPSIS
+
+oracledump [options] <database> <table> [<table> ...]
+
+=head1 DESCRIPTION
+
+Dumps table data from Oracle in the format of an SQL script.  Think
+I<mysqldump> for Oracle.
+
+=over 4
+
+=item <database>
+
+This is the Oracle SID for the database, not the hostname.
+
+=item <table> [<table> ...]
+
+This is a list of one or more table names.  If no table names are
+listed, a list of all tables will be generated and used.
+
+=back
+
+=head1 TO DO
+
+The next major enhancement will be to dump SQL to recreate constraints,
+sequences, triggers and other table metadata.
+
+Please send comments, patches and suggestions to the email address
+below.
+
+=head1 SEE ALSO
+
+L<mysqldump>, L<perl>
+
+=head1 COPYRIGHT
+
+Copyright (C) 1999 David Kilzer.
+
+This library is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=head1 AUTHOR
+
+David Kilzer <ddkilzer@yahoo.com>
+
+=cut
+
