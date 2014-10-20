@@ -1,4 +1,5 @@
 oracledump
 ==========
 
-dumps oracle DB oк only table to SQL format. Easy to grep/parse and insert back
+dumps oracle DB or only selected tables to SQL format. Easy to grep/parse and insert back.
+Mysqldump analogue for oracle
